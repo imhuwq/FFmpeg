@@ -18,6 +18,7 @@
 
 #include <string.h>
 
+#include "libavutil/avassert.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -45,8 +46,6 @@ void av_bsf_free(AVBSFContext **pctx)
     if (ctx->filter->priv_class && ctx->priv_data)
         av_opt_free(ctx->priv_data);
 
-    av_opt_free(ctx);
-
     if (ctx->internal)
         av_packet_free(&ctx->internal->buffer_pkt);
     av_freep(&ctx->internal);
@@ -66,12 +65,18 @@ static void *bsf_child_next(void *obj, void *prev)
     return NULL;
 }
 
+static const char *bsf_to_name(void *bsf)
+{
+    return ((AVBSFContext *)bsf)->filter->name;
+}
+
 static const AVClass bsf_class = {
     .class_name       = "AVBSFContext",
-    .item_name        = av_default_item_name,
+    .item_name        = bsf_to_name,
     .version          = LIBAVUTIL_VERSION_INT,
     .child_next       = bsf_child_next,
     .child_class_next = ff_bsf_child_class_next,
+    .category         = AV_CLASS_CATEGORY_BITSTREAM_FILTER,
 };
 
 const AVClass *av_bsf_get_class(void)
@@ -111,8 +116,6 @@ int av_bsf_alloc(const AVBitStreamFilter *filter, AVBSFContext **pctx)
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-
-    av_opt_set_defaults(ctx);
 
     /* allocate priv data and init private options */
     if (filter->priv_data_size) {
@@ -264,7 +267,6 @@ typedef struct BSFListContext {
     int nb_bsfs;
 
     unsigned idx;           // index of currently processed BSF
-    unsigned flushed_idx;   // index of BSF being flushed
 
     char * item_name;
 } BSFListContext;
@@ -302,57 +304,43 @@ fail:
 static int bsf_list_filter(AVBSFContext *bsf, AVPacket *out)
 {
     BSFListContext *lst = bsf->priv_data;
-    int ret;
+    int ret, eof = 0;
 
     if (!lst->nb_bsfs)
         return ff_bsf_get_packet_ref(bsf, out);
 
     while (1) {
-        if (lst->idx > lst->flushed_idx) {
+        /* get a packet from the previous filter up the chain */
+        if (lst->idx)
             ret = av_bsf_receive_packet(lst->bsfs[lst->idx-1], out);
-            if (ret == AVERROR(EAGAIN)) {
-                /* no more packets from idx-1, try with previous */
-                lst->idx--;
-                continue;
-            } else if (ret == AVERROR_EOF) {
-                /* filter idx-1 is done, continue with idx...nb_bsfs */
-                lst->flushed_idx = lst->idx;
-                continue;
-            }else if (ret < 0) {
-                /* filtering error */
-                break;
-            }
-        } else {
+        else
             ret = ff_bsf_get_packet_ref(bsf, out);
-            if (ret == AVERROR_EOF) {
-                lst->idx = lst->flushed_idx;
-            } else if (ret < 0)
-                break;
-        }
+        if (ret == AVERROR(EAGAIN)) {
+            if (!lst->idx)
+                return ret;
+            lst->idx--;
+            continue;
+        } else if (ret == AVERROR_EOF) {
+            eof = 1;
+        } else if (ret < 0)
+            return ret;
 
+        /* send it to the next filter down the chain */
         if (lst->idx < lst->nb_bsfs) {
-            AVPacket *pkt;
-            if (ret == AVERROR_EOF && lst->idx == lst->flushed_idx) {
-                /* ff_bsf_get_packet_ref returned EOF and idx is first
-                 * filter of yet not flushed filter chain */
-                pkt = NULL;
-            } else {
-                pkt = out;
+            ret = av_bsf_send_packet(lst->bsfs[lst->idx], eof ? NULL : out);
+            av_assert1(ret != AVERROR(EAGAIN));
+            if (ret < 0) {
+                av_packet_unref(out);
+                return ret;
             }
-            ret = av_bsf_send_packet(lst->bsfs[lst->idx], pkt);
-            if (ret < 0)
-                break;
             lst->idx++;
+            eof = 0;
+        } else if (eof) {
+            return ret;
         } else {
-            /* The end of filter chain, break to return result */
-            break;
+            return 0;
         }
     }
-
-    if (ret < 0)
-        av_packet_unref(out);
-
-    return ret;
 }
 
 static void bsf_list_flush(AVBSFContext *bsf)
@@ -361,7 +349,7 @@ static void bsf_list_flush(AVBSFContext *bsf)
 
     for (int i = 0; i < lst->nb_bsfs; i++)
         av_bsf_flush(lst->bsfs[i]);
-    lst->idx = lst->flushed_idx = 0;
+    lst->idx = 0;
 }
 
 static void bsf_list_close(AVBSFContext *bsf)

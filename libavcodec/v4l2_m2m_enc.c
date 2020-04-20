@@ -83,7 +83,7 @@ static inline int v4l2_get_ext_ctrl(V4L2m2mContext *s, unsigned int id, signed i
 
     ret = ioctl(s->fd, VIDIOC_G_EXT_CTRLS, &ctrls);
     if (ret < 0) {
-        av_log(s->avctx, AV_LOG_WARNING, "Failed to set %s\n", name);
+        av_log(s->avctx, AV_LOG_WARNING, "Failed to get %s\n", name);
         return ret;
     }
 
@@ -155,6 +155,17 @@ static int v4l2_check_b_frame_support(V4L2m2mContext *s)
     return AVERROR_PATCHWELCOME;
 }
 
+static inline void v4l2_subscribe_eos_event(V4L2m2mContext *s)
+{
+    struct v4l2_event_subscription sub;
+
+    memset(&sub, 0, sizeof(sub));
+    sub.type = V4L2_EVENT_EOS;
+    if (ioctl(s->fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
+        av_log(s->avctx, AV_LOG_WARNING,
+               "the v4l2 driver does not support end of stream VIDIOC_SUBSCRIBE_EVENT\n");
+}
+
 static int v4l2_prepare_encoder(V4L2m2mContext *s)
 {
     AVCodecContext *avctx = s->avctx;
@@ -164,6 +175,8 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
     /**
      * requirements
      */
+    v4l2_subscribe_eos_event(s);
+
     ret = v4l2_check_b_frame_support(s);
     if (ret)
         return ret;
@@ -172,7 +185,7 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
      * settingss
      */
     if (avctx->framerate.num || avctx->framerate.den)
-        v4l2_set_timeperframe(s, avctx->framerate.num, avctx->framerate.den);
+        v4l2_set_timeperframe(s, avctx->framerate.den, avctx->framerate.num);
 
     /* set ext ctrls */
     v4l2_set_ext_ctrl(s, MPEG_CID(HEADER_MODE), MPEG_VIDEO(HEADER_MODE_SEPARATE), "header mode");
@@ -312,12 +325,12 @@ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
     capture->av_codec_id = avctx->codec_id;
     capture->av_pix_fmt = AV_PIX_FMT_NONE;
 
+    s->avctx = avctx;
     ret = ff_v4l2_m2m_codec_init(priv);
     if (ret) {
         av_log(avctx, AV_LOG_ERROR, "can't configure encoder\n");
         return ret;
     }
-    s->avctx = avctx;
 
     if (V4L2_TYPE_IS_MULTIPLANAR(output->type))
         v4l2_fmt_output = output->format.fmt.pix_mp.pixelformat;
